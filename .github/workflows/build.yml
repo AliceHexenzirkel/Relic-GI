@@ -1,0 +1,143 @@
+# Builds Relic (build/publish.ps1) and its installer (installer/relic.iss) on a GitHub-hosted Windows
+# runner: the same two commands as build\build.bat, from a clean checkout.
+#
+#   Manual: Actions -> "Build Relic" -> Run workflow. Every field is optional; an empty field falls
+#           back to the repository variable named in its description (Settings -> Secrets and
+#           variables -> Actions -> Variables), else to publish.ps1's own default.
+#   Tag:    git tag v1.1 && git push origin v1.1 -> the same build from the variables, plus a DRAFT
+#           GitHub Release with RelicSetup.exe attached (made public by hand from the Releases page).
+#
+# Never bakes an agent token: artifacts and releases can be downloaded by everyone who can read the
+# repository (on a public one, by anyone), and the token is the only security boundary between Player
+# and Server Admin mode. Admin builds stay local (build\publish.ps1 --token=...). The private catalogue
+# (config/versions.json, Drive ids) is not in the repository either: the app ships
+# config/versions.sample.json, which is what a Drive-stripped local build ships anyway.
+
+name: Build Relic
+
+on:
+  workflow_dispatch:
+    inputs:
+      default_server:
+        description: 'Default server, host[:port] (empty = variable RELIC_DEFAULT_SERVER, else none)'
+        type: string
+        required: false
+      default_servers:
+        description: 'Quick picks, "Label=host[:port];..." (empty = variable RELIC_DEFAULT_SERVERS, else none)'
+        type: string
+        required: false
+      default_mode:
+        description: 'player | admin (empty = variable RELIC_DEFAULT_MODE, else no preselected mode)'
+        type: string
+        required: false
+      theme:
+        description: 'summer | classic (empty = variable RELIC_THEME, else summer)'
+        type: string
+        required: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Relic + RelicSetup.exe
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # The runner's Git defaults to core.autocrlf=true and would build from CRLF copies of every text
+      # file .gitattributes does not pin (agent/gio-agent.service, which goes to a Linux box, among
+      # them). Build the committed bytes, like the dev tree (core.autocrlf=false).
+      - name: Keep line endings as committed
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      # For build/check_i18n.py, the translation gate publish.ps1 runs first.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      # publish.ps1 bakes config/agent.token whenever the file exists. It is gitignored; this catches a
+      # force-added one before it ends up inside a downloadable build.
+      - name: Refuse a committed agent token
+        run: |
+          if (Test-Path config/agent.token) { throw 'config/agent.token is committed - a CI build would bake it into a downloadable file' }
+
+      # The inputs travel as environment variables, never pasted into the script text.
+      - name: Publish (build/publish.ps1)
+        env:
+          DEFAULT_SERVER: ${{ inputs.default_server || vars.RELIC_DEFAULT_SERVER }}
+          DEFAULT_SERVERS: ${{ inputs.default_servers || vars.RELIC_DEFAULT_SERVERS }}
+          DEFAULT_MODE: ${{ inputs.default_mode || vars.RELIC_DEFAULT_MODE }}
+          THEME: ${{ inputs.theme || vars.RELIC_THEME }}
+        run: |
+          $a = @()
+          if ($env:DEFAULT_SERVER)  { $a += "--default-server=$env:DEFAULT_SERVER" }
+          if ($env:DEFAULT_SERVERS) { $a += "--default-servers=$env:DEFAULT_SERVERS" }
+          if ($env:DEFAULT_MODE)    { $a += "--default-mode=$env:DEFAULT_MODE" }
+          if ($env:THEME)           { $a += "--theme=$env:THEME" }
+          ./build/publish.ps1 @a
+
+      # Inno Setup 6 is preinstalled on GitHub's Windows images; installed from Chocolatey otherwise.
+      - name: Installer (installer/relic.iss)
+        run: |
+          function Find-Iscc {
+            Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw 'Inno Setup (ISCC.exe) not found' }
+          & $iscc installer/relic.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit code $LASTEXITCODE)" }
+          $setup = Get-Item installer/Output/RelicSetup.exe
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash
+          "RelicSetup.exe: $([math]::Round($setup.Length / 1MB, 1)) MB, SHA-256 ``$sha``" >> $env:GITHUB_STEP_SUMMARY
+
+      # A single file, uploaded unzipped: the run page offers RelicSetup.exe itself. Kept 7 days, since
+      # on a private repository artifacts count against the account's Actions storage.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: installer/Output/RelicSetup.exe
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      # A DRAFT: nothing is public until "Publish release" on the Releases page. A re-run for the same
+      # tag replaces the file on the existing release.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          setup=$(find dist -type f -name RelicSetup.exe -print -quit)
+          if [ -z "$setup" ]; then echo "RelicSetup.exe is missing from the artifact"; ls -R dist; exit 1; fi
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$setup" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$setup" --draft --generate-notes --title "Relic $TAG" --repo "$GITHUB_REPOSITORY"
+          fi
